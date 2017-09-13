@@ -1,11 +1,16 @@
 import re
 import sys
 import timeit
-from collections import Counter
+import inspect
+
+from collections import Counter, defaultdict
 from textwrap import wrap
+from itertools import dropwhile
+from time import time
 
 from django.conf import settings
 from django.db import connections
+from django.db.backends import utils
 from django.utils import termcolors
 
 from . qc_settings import QC_SETTINGS
@@ -38,6 +43,7 @@ class QueryCountMiddleware(MiddlewareMixin):
             self.stats = {"request": {}, "response": {}}
             self.dbs = [c.alias for c in connections.all()]
             self.queries = Counter()
+            self.stacks = defaultdict(set)
             self._reset_stats()
 
             self._start_time = None
@@ -70,6 +76,7 @@ class QueryCountMiddleware(MiddlewareMixin):
                     else:
                         self.stats[which][c.alias]['writes'] += 1
                     self.stats[which][c.alias]['total'] += 1
+                    self.stacks[q['sql']].add(q.get('stacktrace', ''))
                     self.queries[q['sql']] += 1
 
             # We'll show the worst offender; i.e. the query with the most duplicates
@@ -106,6 +113,7 @@ class QueryCountMiddleware(MiddlewareMixin):
             self._count_queries("response")
             self.print_num_queries()
             self._reset_stats()
+
         return response
 
     def _stats_table(self, which, path='', output=None):
@@ -141,6 +149,8 @@ class QueryCountMiddleware(MiddlewareMixin):
                 lines += wrap(query)
                 lines = "\n".join(lines) + "\n"
                 output += self._colorize(lines, count)
+                output += '\n'.join(self.stacks.get(query, []))
+
         return output
 
     def _totals(self, which):
@@ -183,3 +193,50 @@ class QueryCountMiddleware(MiddlewareMixin):
         if elapsed >= self.threshold['MIN_TIME_TO_LOG'] and count >= self.threshold['MIN_QUERY_COUNT_TO_LOG']:
             sys.stderr.write(output)
             sys.stderr.write(sum_output)
+
+
+if settings.DEBUG and QC_SETTINGS['STACKTRACE']:
+    class _StacktraceCursorWrapper(utils.CursorWrapper):
+        def __init__(self, cursor, db):
+            super(_StacktraceCursorWrapper, self).__init__(cursor, db)
+            self.stacktrace_limit = QC_SETTINGS['STACKTRACE']
+
+        def _is_not_fetchall(self, stackline):
+            return not(stackline[3] == '_fetch_all' and stackline[1].endswith('django/db/models/query.py'))
+
+        def _render_stacktrace(self, stack, count=5):
+            stack = list(dropwhile(self._is_not_fetchall, stack))[1:count]
+            return ''.join('At {1}:{2} in {3}\n'.format(*line[:4]) + line[4][0] for line in stack)
+
+        def execute(self, sql, params=None):
+            start = time()
+            try:
+                return super(_StacktraceCursorWrapper, self).execute(sql, params)
+            finally:
+                stop = time()
+                duration = stop - start
+                sql = self.db.ops.last_executed_query(self.cursor, sql, params)
+                self.db.queries_log.append({
+                    'sql': sql,
+                    'time': "%.3f" % duration,
+                    'stacktrace': self._render_stacktrace(inspect.stack(), count=self.stacktrace_limit)
+                })
+
+        def executemany(self, sql, param_list):
+            start = time()
+            try:
+                return super(_StacktraceCursorWrapper, self).executemany(sql, param_list)
+            finally:
+                stop = time()
+                duration = stop - start
+                try:
+                    times = len(param_list)
+                except TypeError:           # param_list could be an iterator
+                    times = '?'
+                self.db.queries_log.append({
+                    'sql': '%s times: %s' % (times, sql),
+                    'time': "%.3f" % duration,
+                    'stacktrace': self._render_stacktrace(inspect.stack(), count=self.stacktrace_limit)
+                })
+
+    utils.CursorDebugWrapper = _StacktraceCursorWrapper
